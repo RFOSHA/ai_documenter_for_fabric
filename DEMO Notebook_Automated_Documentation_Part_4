@@ -1,0 +1,83 @@
+%run "./Notebook_Auto_Doc_Helper_Functions"
+
+import base64
+import requests
+
+# ----------------------------------
+# AZURE DEVOPS WIKI CONFIG
+# ----------------------------------
+AZDO_ORG = <YOUR ORG>
+AZDO_PROJECT = <YOUR PROJECT>
+AZDO_WIKI_NAME = <YOUR AZDO WIKI NAME>
+
+# IMPORTANT: must be under the initialized root page
+WIKI_ROOT_PATH = <ROOT FOR YOUR WIKI PATH>
+
+AZDO_PAT = mssparkutils.credentials.getSecret(<YOUR KEY VAULT URL>, <AZDO PAT KEY NAME>)
+
+from notebookutils import mssparkutils
+
+# --------------------------------------------------
+# Folder → Wiki Section Mapping
+# --------------------------------------------------
+
+DOC_FOLDERS = {
+    # "lakehouses": "Lakehouses",
+    # "semantic_models": "Semantic Models",
+    "pipelines": "Pipelines"
+}
+
+BASE_DOC_PATH = <PATH TO YOUR MARKDOWN FILES IN THE LAKEHOUSE>
+
+# --------------------------------------------------
+# Iterate Each Documentation Folder
+# --------------------------------------------------
+
+for folder_key, wiki_section in DOC_FOLDERS.items():
+
+    folder_path = f"{BASE_DOC_PATH}/{folder_key}"
+
+    print("\n--------------------------------------------")
+    print(f"Processing folder: {folder_path}")
+    print(f"Publishing to wiki section: {wiki_section}")
+
+    try:
+        files = mssparkutils.fs.ls(folder_path)
+    except Exception as e:
+        print(f"Could not access folder: {folder_path}")
+        print(str(e))
+        continue
+
+    for file in files:
+
+        if not file.name.endswith(".md"):
+            continue
+
+        # Remove .md extension
+        doc_name = file.name.replace(".md", "")
+
+        wiki_page_path = (
+            f"{WIKI_ROOT_PATH}/"
+            f"{wiki_section}/"
+            f"{normalize_wiki_name(doc_name)}"
+        )
+
+        print("\nPublishing:", file.path)
+        print("→ Wiki page:", wiki_page_path)
+
+        try:
+            ensure_wiki_ancestors(wiki_page_path)
+
+            publish_markdown_file_to_wiki(
+                md_path=file.path,
+                wiki_page_path=wiki_page_path,
+                comment=f"Auto-generated Fabric {wiki_section} documentation"
+            )
+
+            print("Published successfully")
+
+        except Exception as e:
+            print("Failed publishing:", doc_name)
+            print(str(e))
+
+print("\nAll documentation publishing complete.")
