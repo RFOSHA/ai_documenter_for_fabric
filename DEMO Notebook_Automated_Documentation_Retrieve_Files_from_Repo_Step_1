@@ -1,0 +1,106 @@
+%run "./Notebook_Auto_Doc_Helper_Functions"
+
+# ============================================================
+# AZURE DEVOPS REPOSITORY EXPORT TO FABRIC LAKEHOUSE
+# ============================================================
+#
+# PURPOSE
+# -------
+# This script:
+# 1. Connects to Azure DevOps using a Personal Access Token (PAT)
+# 2. Lists repositories in a given Azure DevOps project
+# 3. Filters to a target repository by name
+# 4. Recursively retrieves all files from that repository/branch
+# 5. Writes those files into the Fabric Lakehouse Files area
+#
+# WHY THIS EXISTS
+# ---------------
+# This is useful when you want to pull a DevOps repo into Fabric so it can be:
+# - documented
+# - analyzed
+# - indexed
+# - version-audited
+# - processed by downstream notebook logic
+#
+# NOTES
+# -----
+# - The script is written for Microsoft Fabric notebooks.
+# - Fabric runtimes may expose filesystem utilities through either:
+#     - notebookutils.mssparkutils
+#     - mssparkutils
+# - This script handles both.
+# - Text files are written as UTF-8 when possible.
+# - Binary files are written through a temporary local file, then copied to Lakehouse.
+# ============================================================
+
+
+# =========================
+# CONFIG
+# =========================
+ORG = <ENTER YOUR ORG>                 # e.g. "myorg"
+PROJECT = <ENTER YOUR PROJECT NAME>
+TARGET_REPO_NAME = <YOUR REPOS NAME>
+BRANCH = "refs/heads/main"             # updated branch if needed
+API_VERSION = "7.1"
+
+## Azure Devops Personal Access Token
+# PAT (recommended: store in Key Vault / Fabric secret; paste here for first run)
+AZDO_PAT = mssparkutils.credentials.getSecret(<YOUR KEY VAULT URL>, <YOUR AZDO PAT>)
+
+# Where to write in Lakehouse Files
+RAW_ROOT = <PATH YOU WANT TO WRITE FILES TO>  # relative path in Spark notebook points to Lakehouse Files 
+
+# Shared request headers for all Azure DevOps API calls
+HEADERS = azdo_headers(AZDO_PAT)
+
+# Returns the repos in your ADO project
+repos_url = f"https://dev.azure.com/{ORG}/{PROJECT}/_apis/git/repositories"
+repos = azdo_get(repos_url, {"api-version": API_VERSION}).get("value", [])
+
+print(f"Found {len(repos)} repos in {ORG}/{PROJECT}")
+for r in repos[:10]:
+    print("-", r["name"])
+
+def list_repo_items(repo_id: str) -> list[dict]:
+    """
+    Return all items in a repository for the configured branch.
+
+    This uses recursionLevel=Full so we get the entire file tree in one call.
+
+    Returned items may include both:
+    - folders
+    - files (gitObjectType == 'blob')
+
+    We later filter to blobs only when downloading file content.
+    """
+    url = f"https://dev.azure.com/{ORG}/{PROJECT}/_apis/git/repositories/{repo_id}/items"
+    params = {
+        "scopePath": "/", 
+        "recursionLevel": "Full",
+        "includeContentMetadata": "true",
+        "versionDescriptor.versionType": "branch",
+        "versionDescriptor.version": BRANCH.replace("refs/heads/", ""),
+        "api-version": API_VERSION,
+    }
+    data = azdo_get(url, params)
+    return data.get("value", [])
+
+# quick test
+test_repo = repos[0]
+items = list_repo_items(test_repo["id"])
+print(test_repo["name"], "items:", len(items))
+print("Sample:", [i["path"] for i in items[:10]])
+
+
+
+repos = [
+    r for r in repos
+    if r["name"] == TARGET_REPO_NAME
+]
+
+print(f"Processing repos: {[r['name'] for r in repos]}")
+
+# Run for all repos
+for repo in repos:
+    # print(repo)
+    dump_repo(repo, 10)
