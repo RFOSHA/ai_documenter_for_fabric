@@ -1,0 +1,399 @@
+import os, json, time, base64, re
+import requests
+from pyspark.sql import functions as F
+from datetime import date
+
+# =========================
+# INPUT (from Notebook 01)
+# =========================
+RAW_ROOT = <PATH TO DOWNLOADED FILES>
+DOCS_ROOT = <PATH WHERE YOU WANT YOUR MARKDOWN FILES WRITTEN TO>
+
+ORG = <YOUR AZURE DEV OPS ORG>       
+PROJECT = <YOUR AZURE DEV OPS PROJCT>                
+
+# =========================
+# OUTPUT OPTIONS
+# =========================
+WRITE_MARKDOWN_TO_LAKEHOUSE = True
+
+AZDO_PAT = mssparkutils.credentials.getSecret(<VALUE KEY URL>, <KEY NANE>)
+
+# =========================
+# AZURE OPENAI
+# =========================
+AZURE_OPENAI_ENDPOINT = "https://data-open-ai.openai.azure.com/"
+AZURE_OPENAI_DEPLOYMENT = <THE NAME OF YOUR LLM DEPLOYMENT>   # your deployment name
+AZURE_OPENAI_API_VERSION = <YOUR API VERSION>  # adjust as needed :contentReference[oaicite:8]{index=8}
+AZURE_OPENAI_API_KEY = mssparkutils.credentials.getSecret(<YOUR KEY VAULT URL>, <KEY NAME>)
+
+PIPELINE_DOC_EXTS = {
+    ".json",      
+    ".ipynb",     
+    ".py",
+    ".sql",
+    ".yml",
+    ".yaml",
+    ".md"
+}
+
+PIPELINES_TABLE = <NAME OF DELTA TABLE FOR PIPELINE INDEX>
+
+TARGET_TOKENS=2500
+OVERLAP_TOKENS=300
+
+FACT_EXTRACTION_PROMPT = """
+You are extracting factual information for technical documentation.
+
+From the content below, extract ONLY concrete facts related to a Fabric pipeline.
+
+Return Markdown bullet points ONLY.
+
+Focus on:
+- Pipeline activities
+- Notebooks referenced
+- Inputs and outputs
+- Dependencies between steps
+- Tables read or written
+- Key transformations or logic
+- Extract explicit, field-level source-to-target mappings
+  - One fact per field
+  - Include source table + column
+  - Include target table + column
+  - Include rename or transformation logic if present
+
+IMPORTANT:
+- Do NOT group fields
+- Do NOT say “all fields” or “1:1 mapping”
+- Emit one bullet per field mapping
+
+DO NOT:
+- Write a full document
+- Add section headers
+- Repeat pipeline overviews
+- Speculate or summarize broadly
+- Reformat into prose
+
+Be precise and concise.
+"""
+
+
+PIPELINE_DOC_PROMPT = """
+You are a senior Microsoft Fabric data architect.
+
+Using ONLY the factual bullets provided, generate a SINGLE,
+clean, non-redundant Markdown document describing the Fabric pipeline.
+
+---------------------------------------------------------------------
+NON-NEGOTIABLE FORMATTING RULES
+---------------------------------------------------------------------
+- Output MUST be valid Markdown.
+- Every heading MUST start on its own line (never share a line with other text).
+- Insert a blank line after EVERY heading.
+- Insert a blank line between paragraphs.
+- Insert a blank line BEFORE and AFTER every table.
+- Insert a blank line BEFORE and AFTER every fenced code block.
+- Use real newline characters. Do NOT output minified Markdown.
+- Do NOT place multiple headings on one line.
+- Mermaid diagrams MUST be wrapped in triple backticks with language 'mermaid'.
+
+If you are about to output a line that contains both a heading marker (e.g., '#', '##', '###') and additional headings later in the same line, you MUST rewrite to put each heading on its own line.
+
+Output:
+- One Pipeline Overview
+- One Architecture section
+- One Execution Flow
+- One Dependencies section
+- One Inputs/Outputs section
+- One Risks & Improvements section
+- Deduplicate aggressively
+- Do NOT repeat sections
+- Infer structure, but NOT new facts
+- Use Mermaid for architecture if appropriate
+- Create an EXHAUSTIVE, FIELD-BY-FIELD source-to-target mapping for each layer (Bronze, Silver, Gold)
+Source-to-Target Mapping Rules (CRITICAL):
+- This section MUST be exhaustive, not illustrative
+- One row per field, no grouping, no wildcards, no “all fields” language
+- Do NOT summarize, do NOT give examples
+- Do NOT use * or placeholders
+- If a table has N columns, the mapping must show N rows
+- If a field is renamed, show both old and new names
+- If a field is passed through unchanged, still list it
+- If a field is derived, document the transformation
+- If a mapping cannot be determined from facts, explicitly mark it as UNKNOWN
+
+Required format per layer:
+
+### <Layer> Source to Target Mapping
+
+| Source Table | Source Column | Target Table | Target Column | Transformation / Logic |
+|-------------|---------------|--------------|---------------|------------------------|
+
+
+DOCUMENT TEMPLATE (MUST FOLLOW EXACTLY):
+
+# <Pipeline Name>
+
+## Overview
+
+<overview paragraph>
+
+## Architecture
+
+```mermaid
+flowchart TD
+  A[Source] --> B[Destination]
+
+"""
+
+def read_abfss_text(path: str) -> str:
+    """
+    Reads a text file from an ABFSS (Azure Blob File System) path using Spark, returning its contents as a single string. 
+    If the read fails for any reason, it returns a clearly marked error message instead of raising an exception.
+    """
+    try:
+        df = spark.read.text(path)
+        return "\n".join(row.value for row in df.collect())
+    except Exception as e:
+        return f"<<FAILED TO READ FILE: {e}>>"
+
+
+def load_and_label_files(paths: list[str]) -> str:
+    """
+    Iterates through a list of file paths, reads each file’s contents, and formats them into labeled sections that include the file name and content. 
+    The result is a single combined string where each file is clearly separated and identified—well-suited for downstream processing or LLM input.
+    """
+    sections = []
+
+    for path in paths:
+        print("Reading:", path)
+
+        content = read_abfss_text(path)
+
+        if "/Files/" in path:
+            rel_path = path.split("/Files/", 1)[-1]
+        else:
+            rel_path = path
+
+        section = f"""
+==============================
+FILE: {rel_path}
+==============================
+{content}
+"""
+        sections.append(section)
+
+    return "\n".join(sections)
+
+def extract_facts_from_file(path: str) -> list[str]:
+    """
+    Takes a file, chunks it up and passes the chunks to the open ai function to get model to pull out facts"
+    Facts are aggregated into a list and returned
+    """
+    text = fs_read_text(path)
+
+    chunks = chunk_text(
+        text,
+        target_tokens=TARGET_TOKENS,
+        overlap_tokens=OVERLAP_TOKENS
+    )
+
+    facts = []
+
+    for i, ch in enumerate(chunks):
+        user_prompt = f"""
+SOURCE FILE: {path}
+CHUNK {i+1} OF {len(chunks)}
+
+CONTENT:
+{ch}
+"""
+        resp = aoai_chat(
+            system=FACT_EXTRACTION_PROMPT,
+            user=user_prompt
+        )
+
+        # normalize bullets
+        for line in resp.splitlines():
+            line = line.strip()
+            if line.startswith("-"):
+                facts.append(line)
+
+        time.sleep(0.15)  # light throttle
+
+    return facts
+
+def extract_pipeline_facts(file_paths: list[str]) -> list[str]:
+    """
+    Takes a list of paths and starts sending the files to extract facts from them using the extract_facts_from_file function
+    """
+    all_facts = []
+
+    for p in file_paths:
+        print("Extracting facts from:", p)
+        file_facts = extract_facts_from_file(p)
+        all_facts.extend(file_facts)
+
+    # De-duplicate deterministically
+    return sorted(set(all_facts))
+
+def list_files_abfss(path: str, extensions=None):
+    """
+    Recursively list files using full ABFSS path.
+    Works across lakehouses and workspaces.
+    We are going to send in the main pipeline folder and then this will find all of the files inside of it
+    """
+
+    hadoop_conf = spark._jsc.hadoopConfiguration()
+    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
+
+    stack = [spark._jvm.org.apache.hadoop.fs.Path(path)]
+    files = []
+
+    while stack:
+        current = stack.pop()
+
+        try:
+            statuses = fs.listStatus(current)
+        except Exception as e:
+            print(f"⚠️ Cannot access: {current}")
+            return []
+
+        for status in statuses:
+            if status.isDirectory():
+                stack.append(status.getPath())
+            else:
+                file_path = str(status.getPath())
+
+                if extensions:
+                    ext = os.path.splitext(file_path.lower())[1]
+                    if ext in extensions:
+                        files.append(file_path)
+                else:
+                    files.append(file_path)
+
+    return files
+
+def generate_pipeline_doc(
+    pipeline_name: str,
+    facts: list[str]
+) -> str:
+    """
+    Takes the facts from a pipeline and then turns them into a markdown file
+    """
+    facts_md = "\n".join(facts)
+
+    user_prompt = f"""
+PIPELINE NAME:
+{pipeline_name}
+
+FACTS:
+{facts_md}
+"""
+    # Call model
+    final_md = aoai_chat(
+        system=PIPELINE_DOC_PROMPT,
+        user=user_prompt
+    )
+
+    print("----- RAW MODEL OUTPUT PREVIEW -----")
+    print(repr(final_md[:500]))
+
+    # Fix escaped newline issue
+    if "\\n" in final_md:
+        final_md = final_md.replace("\\n", "\n")
+
+    # Normalize excessive blank lines
+    import re
+    final_md = re.sub(r"\n{3,}", "\n\n", final_md)
+
+    # Ensure file ends cleanly
+    final_md = final_md.strip() + "\n"
+
+    return final_md
+
+df_pipelines = spark.read.table(PIPELINES_TABLE)
+
+df_to_process = (
+    df_pipelines
+        .filter(F.col("yes") == 1)
+        .filter(
+            (F.col("updated").isNull()) |
+            (F.col("updated") < F.date_sub(F.current_date(), 60))
+        )
+)
+
+count = df_to_process.count()
+print(f"🔍 Pipelines to process (new or stale): {count}")
+
+PIPELINES_TO_PROCESS = [row.asDict() for row in df_to_process.collect()]
+display(df_to_process)
+
+today = date.today()
+
+# Can be used for testing 
+# PIPELINES_TO_PROCESS = [
+#    {
+#        "name": "",
+#        "folder": ""
+#    }
+#]
+
+# Can be used to subset total number of pipelines to run a test
+PIPELINES_TO_PROCESS = PIPELINES_TO_PROCESS
+
+for p in PIPELINES_TO_PROCESS:
+    pipeline_name = p["name"]
+    pipeline_folder = p["folder"]
+
+    # print(pipeline_name, pipeline_folder)
+
+    print("\n--------------------------------------------")
+    print(f"📄 Processing pipeline: {pipeline_name}")
+
+    try:
+        # Use ABFSS-based recursive listing
+        pipeline_files = list_files_abfss(
+            pipeline_folder,
+            extensions=PIPELINE_DOC_EXTS
+        )
+        print(pipeline_files)
+
+        if not pipeline_files:
+            print("No files found, skipping.")
+            continue
+
+        # Extract facts
+        facts = extract_pipeline_facts(pipeline_files)
+        print(facts)
+        if not facts:
+            print("No facts extracted, skipping.")
+            continue
+
+        # Generate markdown
+        final_md = generate_pipeline_doc(
+            pipeline_name=pipeline_name,
+            facts=facts
+        )
+
+        # Write file (this still uses notebook FS, which is fine for current LH)
+        output_path = (
+            "Files/DEMO/devops_docs/pipelines/"
+            f"{pipeline_name.replace('.', '_')}.md"
+        )
+
+        fs_mkdirs("/".join(output_path.split("/")[:-1]))
+        fs_put_text(output_path, final_md, overwrite=True)
+
+        print("Documentation written to:", output_path)
+
+        # Update DATE column only
+        spark.sql(f"""
+            UPDATE {PIPELINES_TABLE}
+            SET updated = DATE('{today}')
+            WHERE name = '{pipeline_name}'
+        """)
+
+    except Exception as e:
+        print(f"Failed pipeline: {pipeline_name}")
+        print(str(e)[:300])
