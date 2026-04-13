@@ -1,0 +1,533 @@
+# ============================================================
+# IMPORTS
+# ============================================================
+import os
+import json
+import time
+import base64
+import re
+from urllib.parse import quote
+
+import requests
+
+
+# ============================================================
+# FABRIC FILESYSTEM HELPERS
+# ============================================================
+def _get_fs():
+    """
+    Return the Fabric filesystem utility object.
+
+    Fabric notebooks may expose filesystem helpers through either:
+      - notebookutils.mssparkutils.fs
+      - mssparkutils.fs
+
+    This wrapper makes the rest of the script runtime-agnostic.
+    """
+    try:
+        from notebookutils import mssparkutils as nb_utils
+        return nb_utils.fs
+    except Exception:
+        try:
+            return mssparkutils.fs  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "Could not find notebookutils/mssparkutils filesystem utilities."
+            ) from e
+
+
+FS = _get_fs()
+
+
+def fs_mkdirs(path: str):
+    """
+    Create a directory path in the Fabric filesystem.
+
+    This is intentionally tolerant:
+    if the directory already exists or mkdirs throws in that situation,
+    the exception is ignored.
+    """
+    try:
+        FS.mkdirs(path)
+    except Exception:
+        # mkdirs can throw if the folder already exists in some runtimes
+        pass
+
+
+def fs_read_text(path: str) -> str:
+    """
+    Read a text file from the Fabric filesystem by first copying it locally.
+
+    This works around the lack of a universal direct read-text helper
+    in mssparkutils across environments.
+    """
+    tmp = f"/tmp/read_{int(time.time() * 1000)}"
+    FS.cp(path, f"file:{tmp}")
+    with open(tmp, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def fs_put_text(path: str, content: str, overwrite: bool = True):
+    """
+    Write a UTF-8 text file to the Fabric filesystem.
+
+    Use this for files that can be decoded as text cleanly.
+    """
+    FS.put(path, content, overwrite)
+
+
+def fs_put_bytes(path: str, b: bytes, overwrite: bool = True):
+    """
+    Write binary content to the Fabric filesystem.
+
+    Why this helper exists:
+    direct binary writes are not always reliable through FS.put, so this method:
+      1. writes bytes to a local temp file
+      2. copies that temp file into the Lakehouse using FS.cp
+
+    This works well for binary files such as notebooks, images, archives, etc.
+    """
+    tmp = f"/tmp/{int(time.time() * 1000)}_{os.path.basename(path)}"
+
+    with open(tmp, "wb") as f:
+        f.write(b)
+
+    if overwrite:
+        try:
+            FS.rm(path, True)
+        except Exception:
+            pass
+
+    FS.cp(f"file:{tmp}", path)
+
+
+# ============================================================
+# GENERAL UTILITY HELPERS
+# ============================================================
+def safe_join(*parts: str) -> str:
+    """
+    Join path segments using forward slashes.
+
+    This normalizes:
+    - leading/trailing slashes
+    - Windows backslashes
+
+    Example:
+        safe_join("Files/devops_raw", "project", "/repo/path/file.py")
+    becomes:
+        Files/devops_raw/project/repo/path/file.py
+    """
+    return "/".join(
+        [p.strip("/").replace("\\", "/") for p in parts if p is not None and p != ""]
+    )
+
+
+def estimate_tokens(s: str) -> int:
+    """
+    Get a rough approximation of how many tokens are in a body of text.
+    """
+    # Rough heuristic: ~4 characters per token
+    return max(1, len(s) // 4)
+
+
+def chunk_text(
+    s: str,
+    target_tokens: int = 900,
+    overlap_tokens: int = 100
+) -> list[str]:
+    """
+    Split a large string into overlapping chunks sized approximately by token count.
+
+    This is useful for sending long content to LLMs while preserving enough
+    overlap between chunks for continuity.
+    """
+    target_chars = target_tokens * 4
+    overlap_chars = overlap_tokens * 4
+
+    chunks = []
+    i = 0
+
+    while i < len(s):
+        j = min(len(s), i + target_chars)
+        chunk = s[i:j]
+        chunks.append(chunk)
+
+        if j == len(s):
+            break
+
+        i = max(0, j - overlap_chars)
+
+    return chunks
+
+
+def is_probably_text(path: str) -> bool:
+    """
+    Return True if the file extension suggests this is a text-based file.
+
+    This helps decide whether to:
+    - decode bytes and write as UTF-8 text
+    - or preserve raw bytes and write as binary
+    """
+    ext = path.lower().split(".")[-1] if "." in path else ""
+    return ext in {
+        "py", "ipynb", "sql", "md", "txt", "json", "yml", "yaml",
+        "toml", "ini", "cfg", "xml", "csv", "ts", "js", "css",
+        "html", "pbip", "pbir"
+    }
+
+
+# ============================================================
+# AZURE OPENAI HELPERS
+# ============================================================
+def aoai_chat(system: str, user: str) -> str:
+    """
+    Send a chat completion request to Azure OpenAI and return the response text.
+    """
+    url = (
+        f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/"
+        f"{AZURE_OPENAI_DEPLOYMENT}/chat/completions"
+    )
+
+    params = {"api-version": AZURE_OPENAI_API_VERSION}
+    headers = {
+        "api-key": AZURE_OPENAI_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.2,
+    }
+
+    r = requests.post(
+        url,
+        headers=headers,
+        params=params,
+        json=payload,
+        timeout=120
+    )
+    r.raise_for_status()
+
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+
+# ============================================================
+# AZURE DEVOPS AUTH / REQUEST HELPERS
+# ============================================================
+def azdo_headers(pat: str) -> dict:
+    """
+    Build Azure DevOps authorization headers using a PAT.
+
+    Azure DevOps expects PAT auth in Basic format, where the PAT is passed as:
+        username:blank
+    which becomes:
+        :PAT
+    before base64 encoding.
+    """
+    token = base64.b64encode(f":{pat}".encode("utf-8")).decode("utf-8")
+    return {"Authorization": f"Basic {token}"}
+
+
+def azdo_get(url: str, params: dict | None = None) -> dict:
+    """
+    Send a GET request to Azure DevOps and return the parsed JSON response.
+
+    Raises:
+        requests.HTTPError if the API call fails
+    """
+    r = requests.get(url, headers=HEADERS, params=params, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+# ============================================================
+# AZURE DEVOPS REPOSITORY HELPERS
+# ============================================================
+def download_item(repo_id: str, path: str) -> bytes:
+    """
+    Download the raw content of a single repository file.
+
+    Parameters:
+        repo_id: Azure DevOps repository ID
+        path: repo-relative file path, such as '/notebooks/example.ipynb'
+
+    Returns:
+        Raw file bytes
+    """
+    url = f"https://dev.azure.com/{ORG}/{PROJECT}/_apis/git/repositories/{repo_id}/items"
+
+    params = {
+        "path": path,
+        "includeContent": "true",
+        "resolveLfs": "true",
+        "versionDescriptor.versionType": "branch",
+        "versionDescriptor.version": BRANCH.replace("refs/heads/", ""),
+        "api-version": API_VERSION,
+    }
+
+    r = requests.get(url, headers=HEADERS, params=params, timeout=120)
+    r.raise_for_status()
+    return r.content
+
+
+def dump_repo(repo: dict, max_files: int | None = None):
+    """
+    Export all files from a single Azure DevOps repository into the Lakehouse.
+
+    Process:
+    1. Create a base destination folder
+    2. List all repo items
+    3. Filter to actual files only (git blobs)
+    4. Download each file
+    5. Write text files as UTF-8 when possible
+    6. Write non-text or undecodable files as binary
+
+    Parameters:
+        repo: repository metadata dictionary from Azure DevOps
+        max_files: optional cap for testing/debugging
+    """
+    repo_name = repo["name"]
+    repo_id = repo["id"]
+    base_dir = safe_join(RAW_ROOT, PROJECT, repo_name)
+
+    fs_mkdirs(base_dir)
+
+    items = list_repo_items(repo_id)
+    files = [i for i in items if i.get("gitObjectType") == "blob"]
+    print(f"[{repo_name}] files: {len(files)}")
+
+    count = 0
+
+    for it in files:
+        if max_files and count >= max_files:
+            break
+
+        path = it["path"]           # e.g. "/notebooks/foo.ipynb"
+        rel = path.lstrip("/")
+        dest = safe_join(base_dir, rel)
+
+        # Ensure parent folder exists before writing the file
+        parent = "/".join(dest.split("/")[:-1])
+        if parent:
+            fs_mkdirs(parent)
+
+        try:
+            blob = download_item(repo_id, path)
+
+            if is_probably_text(path):
+                # Best-effort UTF-8 decode; if not valid text, fall back to binary write
+                try:
+                    fs_put_text(dest, blob.decode("utf-8"), overwrite=True)
+                except UnicodeDecodeError:
+                    fs_put_bytes(dest, blob, overwrite=True)
+            else:
+                fs_put_bytes(dest, blob, overwrite=True)
+
+            count += 1
+
+            if count % 100 == 0:
+                print(f"  wrote {count} files...")
+
+        except Exception as e:
+            print("ERROR:", repo_name, path, str(e)[:200])
+
+    print(f"[{repo_name}] wrote {count} files to {base_dir}")
+
+
+# ============================================================
+# AZURE DEVOPS WIKI HELPERS
+# ============================================================
+def normalize_wiki_name(name: str) -> str:
+    """
+    Normalize a name so it is safer to use in wiki/page contexts.
+    """
+    return (
+        name.replace(".", "_")
+            .replace(" ", "_")
+            .replace(":", "_")
+    )
+
+
+def wiki_create_or_update_page(
+    page_path: str,
+    content_md: str,
+    comment: str = "Auto-generated Fabric documentation"
+):
+    """
+    Create or update an Azure DevOps Wiki page with Markdown content.
+    """
+    base = f"https://dev.azure.com/{ORG}/{PROJECT}/_apis/wiki/wikis/{WIKI_ID_OR_NAME}/pages"
+
+    params = {
+        "path": page_path,
+        "comment": comment,
+        "api-version": "7.1",
+    }
+
+    headers = azdo_headers(AZDO_PAT)
+    headers["Content-Type"] = "application/json"
+
+    body = {"content": content_md}
+
+    r = requests.put(base, headers=headers, params=params, json=body, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def ensure_wiki_page_exists(page_path: str):
+    """
+    Ensure a Wiki page exists by creating it if it is missing.
+
+    Safe to call repeatedly.
+    """
+    url = (
+        f"https://dev.azure.com/{AZDO_ORG}/{AZDO_PROJECT}"
+        f"/_apis/wiki/wikis/{AZDO_WIKI_NAME}/pages"
+    )
+
+    # First check whether the page already exists
+    r = requests.get(
+        url,
+        headers=azdo_headers(AZDO_PAT),
+        params={
+            "path": page_path,
+            "api-version": "7.0"
+        },
+        timeout=30
+    )
+
+    if r.status_code == 200:
+        return
+
+    # If the page does not exist, create a minimal placeholder page
+    if r.status_code == 404:
+        create = requests.put(
+            url,
+            headers=azdo_headers(AZDO_PAT),
+            params={
+                "path": page_path,
+                "api-version": "7.0",
+                "comment": "Auto-created ancestor page"
+            },
+            json={
+                "content": f"# {page_path.split('/')[-1]}\n\n_Auto-created container page._"
+            },
+            timeout=30
+        )
+
+        if create.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Failed to create ancestor page {page_path}: "
+                f"{create.status_code} - {create.text}"
+            )
+
+        return
+
+    raise RuntimeError(
+        f"Unexpected response checking page {page_path}: "
+        f"{r.status_code} - {r.text}"
+    )
+
+
+def ensure_wiki_ancestors(full_page_path: str):
+    """
+    Ensure all parent Wiki pages exist.
+
+    Example:
+      /a/b/c -> ensures /a and /a/b exist
+    """
+    parts = full_page_path.strip("/").split("/")
+
+    for i in range(1, len(parts)):
+        ancestor = "/" + "/".join(parts[:i])
+        ensure_wiki_page_exists(ancestor)
+
+
+def get_wiki_page_etag(wiki_page_path: str) -> str | None:
+    """
+    Get the current ETag for a Wiki page.
+
+    Azure DevOps uses the ETag for safe overwrite/update behavior.
+    """
+    url = (
+        f"https://dev.azure.com/{AZDO_ORG}/{AZDO_PROJECT}"
+        f"/_apis/wiki/wikis/{AZDO_WIKI_NAME}/pages"
+    )
+
+    r = requests.get(
+        url,
+        headers=azdo_headers(AZDO_PAT),
+        params={
+            "path": wiki_page_path,
+            "api-version": "7.0"
+        },
+        timeout=30
+    )
+
+    if r.status_code == 200:
+        return r.headers.get("ETag")
+
+    if r.status_code == 404:
+        return None
+
+    raise RuntimeError(
+        f"Failed to get wiki page {wiki_page_path}: "
+        f"{r.status_code} - {r.text}"
+    )
+
+
+def read_markdown_from_lakehouse(md_path: str) -> str:
+    """
+    Read a markdown file stored in the Lakehouse.
+    """
+    return fs_read_text(md_path)
+
+
+def publish_markdown_file_to_wiki(
+    md_path: str,
+    wiki_page_path: str,
+    comment: str
+):
+    """
+    Read a markdown file from the Lakehouse and publish it to the Azure DevOps Wiki.
+
+    If the page already exists, its ETag is used so the update behaves as an
+    intentional overwrite rather than an unsafe blind write.
+    """
+    markdown_content = fs_read_text(md_path)
+
+    url = (
+        f"https://dev.azure.com/{AZDO_ORG}/{AZDO_PROJECT}"
+        f"/_apis/wiki/wikis/{AZDO_WIKI_NAME}/pages"
+    )
+
+    etag = get_wiki_page_etag(wiki_page_path)
+
+    headers = {
+        **azdo_headers(AZDO_PAT),
+        "Content-Type": "application/json"
+    }
+
+    if etag:
+        headers["If-Match"] = etag
+
+    r = requests.put(
+        url,
+        headers=headers,
+        params={
+            "path": wiki_page_path,
+            "comment": comment,
+            "api-version": "7.0"
+        },
+        json={"content": markdown_content},
+        timeout=60
+    )
+
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Wiki publish failed: {r.status_code} - {r.text}")
+
+    return r.json()
