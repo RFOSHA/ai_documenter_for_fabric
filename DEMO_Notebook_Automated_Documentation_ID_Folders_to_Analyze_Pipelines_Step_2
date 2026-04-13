@@ -1,0 +1,91 @@
+%run "./Notebook_Auto_Doc_Helper_Functions"
+
+# ============================================
+# CONFIG
+# ============================================
+
+from pyspark.sql import functions as F
+
+DELTA_PATH = <ENTER PATH FOR DELTA TABLE YOU WANT CREATED TO HOUSE PIPELINE INVENTORY>
+
+ROOT_REPO_PATH = <UPDATE WITH PATH TO WHERE PIPELINE FILES ARE STORED>
+PIPELINE_SUFFIX = ".DataPipeline"
+
+def list_all_paths(root: str) -> list:
+    """
+    Performs a full recursive traversal of the filesystem starting from the given root path, returning every file and directory it can reach. 
+    It uses a stack-based approach (depth-first search) and gracefully skips over any paths it cannot access.
+    """
+    paths = []
+    stack = [root]
+
+    while stack:
+        path = stack.pop()
+        try:
+            for item in FS.ls(path):
+                paths.append(item)
+                if item.isDir:
+                    stack.append(item.path)
+        except Exception as e:
+            print(f"⚠️ Skipping: {path} ({e})")
+
+    return paths
+
+
+
+def discover_pipelines(root_path: str) -> list[dict]:
+    """
+    Scans the filesystem under the given root and identifies Fabric Data Pipelines by locating directories whose names end with .DataPipeline. 
+    It returns a deduplicated list of pipeline metadata, including the pipeline name and its parent folder location.
+    """
+    pipelines = []
+
+    all_items = list_all_paths(root_path)
+
+    for item in all_items:
+        if item.isDir:
+            name = item.path.rstrip("/").split("/")[-1]
+            if name.endswith(PIPELINE_SUFFIX):
+                pipelines.append(
+                    {
+                        "name": name,
+                        "folder": "/".join(item.path.rstrip("/").split("/")[:-1]),
+                    }
+                )
+
+    # Deduplicate by pipeline name
+    pipelines = list({p["name"]: p for p in pipelines}.values())
+    return pipelines
+
+PIPELINES = discover_pipelines(ROOT_REPO_PATH)
+
+print(f"Discovered {len(PIPELINES)} pipelines:\n")
+for p in PIPELINES:
+    print(f"- {p['name']}")
+    print(f"  folder: {p['folder']}\n")
+
+
+
+# ============================================
+# CREATE DATAFRAME
+# ============================================
+
+# Convert list of dicts -> Spark DataFrame
+df = spark.createDataFrame(PIPELINES)
+
+df = df.withColumn("yes", F.lit(1))
+df = df.withColumn("updated", F.to_date(F.lit("2025-01-01")))
+
+# ============================================
+# WRITE DELTA TABLE
+# ============================================
+
+(
+    df.write
+    .format("delta")
+    .mode("overwrite")  # overwrite existing table
+    .option("overwriteSchema", "true")  # allows schema changes over time
+    .save(DELTA_PATH)
+)
+
+print(f"✅ Wrote {df.count()} pipelines to Delta table at {DELTA_PATH}")
